@@ -58,11 +58,19 @@ from langchain.prompts import (
 )
 
 system_template = """
-You are a TB awareness assistant.
+You are TB-AwareGPT, an assistant for NGO volunteers.
 Answer ONLY using the information in the provided source document chunks.
+When volunteers mentions to respond Hindi, produce answers in Hindi.
+
+Keep replies short and actionable.
 - Always cite the source chunk id (metadata 'source').
-- If the answer is not in the document, say: "I cannot find that in the manual; please refer to the local PHC or call 1800-11-6666."
+- If the answer is not in the document or is not related to TB, say: "I cannot find that in the manual; please refer to the local PHC or call 1800-11-6666."
 - Do not make up or assume anything outside the document.
+
+Language control:
+- If lang="hi", respond in Hindi.
+- If lang="en", respond in English.
+- Default to English unless explicitly told otherwise.
 
 Examples (do NOT invent answers):
 Q: Who is Sachin Tendulkar?
@@ -70,6 +78,9 @@ A: I cannot find that in the manual; please refer to the local PHC or call 1800-
 
 Q: What are TB symptoms?
 A: The main symptoms are: persistent cough for 2 weeks or more, fever, night sweats, weight loss, fatigue. Source: chunk_12
+
+Q: Are fever, night sweats, loss of appetite symptoms of TB?
+A: Yes, fever, night sweats, loss of appetite are common symptons of TB. Source: chunk_12
 """
 
 human_template = """
@@ -88,6 +99,7 @@ human_msg = HumanMessagePromptTemplate.from_template(human_template)
 chat_prompt = ChatPromptTemplate.from_messages([system_msg, human_msg])
 
 from langchain.chains import RetrievalQA
+from langchain.schema import HumanMessage
 
 system_instructions = """
 You are TB-AwareGPT, an assistant for NGO volunteers.
@@ -112,19 +124,45 @@ def answer_query(user_name, question, lang="en"):
     if lang.lower().startswith("hi"):
         # ask LLM to translate/compose in Hindi, but still constrained
         prompt = f"Translate and adapt to conversational Hindi the following factual answer (do not add new info):\n\n{answer}"
-        answer_hi = llm(prompt)
-        return answer_hi.content
+        return llm([HumanMessage(content=prompt)]).content
     return answer
 
-def generate_quiz(section_text, n_questions=3, lang="en"):
-    prompt = f"""
-    Create {n_questions} short quiz items (question, three options, correct option, one-line explanation)
-    based ONLY on the following text: {section_text}
-    Output as JSON list: [{{"q":"", "opts":["","", ""], "a":0, "ex":"..."}}, ...]
+def generate_quiz_from_topic(topic_query, n_questions=5, lang="en"):
+    # Retrieve relevant chunks using the topic query
+    relevant_docs = retriever.get_relevant_documents(topic_query)
+
+    # Combine the text from top chunks
+    section_text = "\n\n".join([doc.page_content for doc in relevant_docs])
+
+    # Generate quiz from the combined section
+    return generate_quiz(section_text, n_questions=n_questions, lang=lang)
+
+def generate_quiz(section_text, n_questions=5, lang="en"):
+    # Few-shot examples to guide format and tone
+    quiz_few_shots = """
+    Example:
+    Q: What is the minimum duration of TB treatment?
+    Options: ["2 weeks", "6 months", "1 year"]
+    Answer: 1
+    Explanation: TB treatment typically lasts at least 6 months.
+
+    Q: Which symptom is most common in pulmonary TB?
+    Options: ["Skin rash", "Persistent cough", "Joint pain"]
+    Answer: 1
+    Explanation: Persistent cough is a hallmark of pulmonary TB.
     """
-    resp = llm(prompt)
-    # parse resp.content into structured quiz (use json.loads after ensuring valid JSON)
-    return resp.content
+
+    # Construct prompt with examples + section text
+    prompt = f"""
+    {quiz_few_shots}
+
+    Now create {n_questions} quiz items based ONLY on the following text:
+    {section_text}
+
+    Output as JSON list: [{{"q": "...", "opts": ["...", "...", "..."], "a": 0, "ex": "..."}}]
+    Respond in {'Hindi' if lang.lower().startswith('hi') else 'English'}.
+    """
+    return llm([HumanMessage(content=prompt)]).content
 
 def grade_answer(quiz_item, given_answer_index):
     correct = quiz_item["a"]
@@ -132,11 +170,28 @@ def grade_answer(quiz_item, given_answer_index):
         return True, "Correct: " + quiz_item["ex"]
     return False, f"Incorrect. Correct: option {correct+1}. {quiz_item['ex']}"
 
-query = "What are the common symptoms of TB I should tell people about?"
+query = "What are the common symptoms of TB?"
 result = qa_chain.invoke({"query": query})
 print("Answer:", result["result"])
 
-query = "Who is Sachin Tendulkar"
+query = "what are symptoms of covid 19"
 result = qa_chain.invoke({"query": query})
 print("Answer:", result["result"])
+
+query = "What are the 5 common symptoms of TB I should tell people about? Please answer in Hindi"
+result = qa_chain.invoke({"query": query})
+print("Answer:", result["result"])
+
+query = "Are fever, chest pain , loss of appetite symptoms of TB?"
+result = qa_chain.invoke({"query": query})
+print("Answer:", result["result"])
+
+response = answer_query("Sumit", "Are fever, night sweats, loss of appetite symptoms of TB?", lang="en")
+print("Answer:", response)
+
+quiz = generate_quiz_from_topic("TB symptoms", n_questions=5, lang="en")
+print(quiz)
+
+quiz = generate_quiz_from_topic("TB symptoms", n_questions=5, lang="hi")
+print(quiz)
 
