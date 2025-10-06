@@ -34,7 +34,7 @@ from langchain.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain.memory import ConversationBufferWindowMemory
 
-llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.0, max_tokens=1024)
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.5, max_tokens=1024)
 memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
 
 loader = PyPDFLoader("/content/Guidance-Document-on-TB-Mukt-Bharat-Abhiyan_0.pdf")
@@ -194,4 +194,69 @@ print(quiz)
 
 quiz = generate_quiz_from_topic("TB symptoms", n_questions=5, lang="hi")
 print(quiz)
+
+intent_examples = {
+    "generate_quiz": [
+        "Give me a quiz on TB symptoms",
+        "Create MCQs for TB awareness",
+        "Can I get some practice questions?"
+    ],
+    "answer_query": [
+        "How can we prevent TB?",
+        "What are TB symptoms?",
+        "Tell me about TB treatment duration"
+    ],
+    "grade_answer": [
+        "Evaluate my quiz answers",
+        "Did I get this question right?",
+        "Score my response"
+    ]
+}
+
+from langchain.schema import Document
+
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Flatten examples into documents with metadata
+intent_docs = []
+for intent, examples in intent_examples.items():
+    for ex in examples:
+        intent_docs.append(Document(page_content=ex, metadata={"intent": intent}))
+
+intent_index = FAISS.from_documents(intent_docs, embedding_model)
+
+def route_intent_semantic(user_input):
+    results = intent_index.similarity_search(user_input, k=1)
+    if results:
+        return results[0].metadata["intent"]
+    return "default"
+
+user_input = "Can you give me a quiz on TB symptoms?"
+intent = route_intent_semantic(user_input)
+
+def ask_llm(intent):
+  if intent == "generate_quiz":
+      response = generate_quiz_from_topic(user_input, n_questions=5, lang="en")
+  elif intent == "answer_query":
+      response = answer_query("Sumit", user_input, lang="en")
+  elif intent == "grade_answer":
+      response = "Grading not yet wired—coming soon!"
+  else:
+      response = "Sorry, I couldn't understand your request. Please try again."
+  return response
+
+user_input = "Can you give me some TB symptoms?"
+intent = route_intent_semantic(user_input)
+response = ask_llm(intent)
+print("Response:", response)
+
+user_input = "Can you give some basic ways we can prevent TB from spreading? Can you please reply in Hindi"
+intent = route_intent_semantic(user_input)
+response = ask_llm(intent)
+print("Response:", response)
+
+user_input = "Can you give some basic ways we can prevent TB from spreading?"
+intent = route_intent_semantic(user_input)
+response = ask_llm(intent)
+print("Response:", response)
 
