@@ -18,11 +18,11 @@ import PyPDF2
 import chromadb
 from dotenv import load_dotenv
 
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = ""
 
 load_dotenv()
 from openai import OpenAI
-client = OpenAI(api_key="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")
+client = OpenAI(api_key="")
 
 # Initialize ChromaDB
 chroma_client = chromadb.Client()
