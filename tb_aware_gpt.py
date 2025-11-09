@@ -7,256 +7,157 @@ Original file is located at
     https://colab.research.google.com/drive/166MSk-z8l9M_QuEBW0rTgLnjr6r_dLDJ
 """
 
+! pip install PyPDF2
+
+! pip install chromadb
+
+from openai import OpenAI
+import gradio as gr
 import os
-from getpass import getpass
+import PyPDF2
+import chromadb
+from dotenv import load_dotenv
 
-# Set up OpenAI API key
-groq_api_key = getpass("Enter your Groq key: ")
-os.environ["GROQ_API_KEY"] = groq_api_key
+os.environ["OPENAI_API_KEY"] = "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"
 
-!pip install -q langchain openai chromadb tiktoken pypdf langchain_openai
+load_dotenv()
+from openai import OpenAI
+client = OpenAI(api_key="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")
 
-!pip install -q langchain-community
+# Initialize ChromaDB
+chroma_client = chromadb.Client()
+collection = chroma_client.create_collection(name="TB-PDFs")
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.prompts import ChatPromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF file"""
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+    return text
 
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
+def chunk_text(text, chunk_size=1000):
+    """Split text into chunks"""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+    return chunks
 
-!pip install langchain-groq langchain duckduckgo-search langchain_community ddgs  --quiet
+def store_pdf_in_db(pdf_path):
+    """Extract, chunk and store PDF in ChromaDB"""
+    try:
+        text = extract_text_from_pdf(pdf_path)
+        chunks = chunk_text(text)
 
-from langchain_groq import ChatGroq
-from langchain.memory import ConversationBufferWindowMemory
+        # Clear existing data
+        collection.delete(where={"filename": "National-Guidelines-for-Management-of-DR-TB_Final.pdf"})
 
-llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.5, max_tokens=1024)
-memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
+        # Add chunks to ChromaDB
+        for i, chunk in enumerate(chunks):
+            collection.add(
+                documents=[chunk],
+                metadatas=[{"source": pdf_path, "chunk_id": i}],
+                ids=[f"chunk_{i}"]
+            )
+        return f"✅ Successfully loaded {len(chunks)} chunks from {pdf_path}"
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
-loader = PyPDFLoader("/content/Guidance-Document-on-TB-Mukt-Bharat-Abhiyan_0.pdf")
-docs = loader.load()
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-chunks = splitter.split_documents(docs)
+def get_relevant_context(query, n_results=3):
+    """Retrieve relevant context from ChromaDB"""
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results
+    )
+    return "\n\n".join(results['documents'][0]) if results['documents'] else ""
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"  # lightweight and fast
-)
+def chat_with_tb_bot(message, history):
+    try:
+        # Get relevant context from PDF
+        context = get_relevant_context(message)
 
-pip install langchain faiss-cpu sentence-transformers
+        system_prompt = """You are a TB Aware Bot. Use the provided context from PDFs to answer questions accurately.
+        If the context doesn't contain relevant information, use your general knowledge but mention this."""
 
-vectorstore = FAISS.from_documents(chunks, embedding_model)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        user_content = f"Context from PDF:\n{context}\n\nQuestion: {message}"
 
-from langchain.prompts import (
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-    ChatPromptTemplate,
-)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2
+        )
 
-system_template = """
-You are TB-AwareGPT, an assistant for NGO volunteers.
-Answer ONLY using the information in the provided source document chunks.
-When volunteers mentions to respond Hindi, produce answers in Hindi.
+        return response.choices[0].message.content
+    except Exception as e:
+        import traceback
+        print("❌ Backend error:", e)
+        traceback.print_exc()
+        return f"❌ Error in backend: {str(e)}"
 
-Keep replies short and actionable.
-- Always cite the source chunk id (metadata 'source').
-- If the answer is not in the document or is not related to TB, say: "I cannot find that in the manual; please refer to the local PHC or call 1800-11-6666."
-- Do not make up or assume anything outside the document.
+def load_pdf_and_chat(pdf_file, message, history):
+    # First store the PDF
+    result_msg = store_pdf_in_db(pdf_file.name)
 
-Language control:
-- If lang="hi", respond in Hindi.
-- If lang="en", respond in English.
-- Default to English unless explicitly told otherwise.
+    # Then get response
+    response = chat_with_tb_bot(message, history)
 
-Examples (do NOT invent answers):
-Q: Who is Sachin Tendulkar?
-A: I cannot find that in the manual; please refer to the local PHC or call 1800-11-6666.
+    return result_msg, response
 
-Q: What are TB symptoms?
-A: The main symptoms are: persistent cough for 2 weeks or more, fever, night sweats, weight loss, fatigue. Source: chunk_12
+def launch_app():
+    with gr.Blocks() as demo:
+        gr.Markdown("# ⚛️ TB Aware chatbot with PDF RAG")
 
-Q: Are fever, night sweats, loss of appetite symptoms of TB?
-A: Yes, fever, night sweats, loss of appetite are common symptons of TB. Source: chunk_12
-"""
+        with gr.Row():
+            with gr.Column():
+                pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"])
+                load_btn = gr.Button("Load PDF into Knowledge Base")
+                load_status = gr.Textbox(label="Load Status", interactive=False)
 
-human_template = """
-Use the following document snippets to answer the question.
-If snippets do not contain the answer, reply: "I cannot find that in the manual; please refer to the local PHC or call 1800-11-6666."
+            with gr.Column():
+                chat_interface = gr.ChatInterface(
+                    fn=chat_with_tb_bot,
+                    title="Chat with TB Aware Bot",
+                    description="Ask questions about the loaded PDF or related to TB"
+                )
 
---- Retrieved snippets:
-{context}
+        # Load PDF when button clicked
+        load_btn.click(
+            fn=lambda pdf: store_pdf_in_db(pdf.name) if pdf else "Please upload a PDF first",
+            inputs=[pdf_input],
+            outputs=[load_status]
+        )
 
---- Question:
-{question}
-"""
+    demo.launch()
 
-system_msg = SystemMessagePromptTemplate.from_template(system_template)
-human_msg = HumanMessagePromptTemplate.from_template(human_template)
-chat_prompt = ChatPromptTemplate.from_messages([system_msg, human_msg])
+# https://github.com/sumit1311singh/TB-Aware-GPT/blob/main/National-Guidelines-for-Management-of-DR-TB_Final.pdf
+# https://raw.githubusercontent.com/sumit1311singh/TB-Aware-GPT/main/National-Guidelines-for-Management-of-DR-TB_Final.pdf
 
-from langchain.chains import RetrievalQA
-from langchain.schema import HumanMessage
+import requests
+import os
 
-system_instructions = """
-You are TB-AwareGPT, an assistant for NGO volunteers.
-Answer using ONLY the provided manual excerpts. Do NOT provide medical advice beyond the manual.
-If the question is not related to TB, please say "Question not related to TB, please ask question related to TB"
-When volunteers prefer Hindi, produce answers in Hindi. Keep replies short and actionable.
-"""
+def download_pdf_from_github(url, filename="TBAwarenessFile.pdf"):
+    response = requests.get(url)
+    response.raise_for_status()  # ensure no errors
+    with open(filename, "wb") as f:
+        f.write(response.content)
+    return filename
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": chat_prompt},
-)
+if __name__ == "__main__":
+    # Example GitHub raw URL
+    github_pdf_url = "https://raw.githubusercontent.com/sumit1311singh/TB-Aware-GPT/main/National-Guidelines-for-Management-of-DR-TB_Final.pdf"
 
-def answer_query(user_name, question, lang="en"):
-    # get retrieved docs and answer
-    result = qa_chain({"query": question})
-    answer = result["result"]  # the LLM-produced answer
-    # Localization
-    if lang.lower().startswith("hi"):
-        # ask LLM to translate/compose in Hindi, but still constrained
-        prompt = f"Translate and adapt to conversational Hindi the following factual answer (do not add new info):\n\n{answer}"
-        return llm([HumanMessage(content=prompt)]).content
-    return answer
+    # Download PDF
+    pdf_file = download_pdf_from_github(github_pdf_url, "TBAwarenessFile.pdf")
+    print(f"Downloaded PDF: {pdf_file}")
 
-def generate_quiz_from_topic(topic_query, n_questions=5, lang="en"):
-    # Retrieve relevant chunks using the topic query
-    relevant_docs = retriever.get_relevant_documents(topic_query)
+    # Store in DB
+    store_pdf_in_db(pdf_file)
 
-    # Combine the text from top chunks
-    section_text = "\n\n".join([doc.page_content for doc in relevant_docs])
-
-    # Generate quiz from the combined section
-    return generate_quiz(section_text, n_questions=n_questions, lang=lang)
-
-def generate_quiz(section_text, n_questions=5, lang="en"):
-    # Few-shot examples to guide format and tone
-    quiz_few_shots = """
-    Example:
-    Q: What is the minimum duration of TB treatment?
-    Options: ["2 weeks", "6 months", "1 year"]
-    Answer: 1
-    Explanation: TB treatment typically lasts at least 6 months.
-
-    Q: Which symptom is most common in pulmonary TB?
-    Options: ["Skin rash", "Persistent cough", "Joint pain"]
-    Answer: 1
-    Explanation: Persistent cough is a hallmark of pulmonary TB.
-    """
-
-    # Construct prompt with examples + section text
-    prompt = f"""
-    {quiz_few_shots}
-
-    Now create {n_questions} quiz items based ONLY on the following text:
-    {section_text}
-
-    Output as JSON list: [{{"q": "...", "opts": ["...", "...", "..."], "a": 0, "ex": "..."}}]
-    Respond in {'Hindi' if lang.lower().startswith('hi') else 'English'}.
-    """
-    return llm([HumanMessage(content=prompt)]).content
-
-def grade_answer(quiz_item, given_answer_index):
-    correct = quiz_item["a"]
-    if given_answer_index == correct:
-        return True, "Correct: " + quiz_item["ex"]
-    return False, f"Incorrect. Correct: option {correct+1}. {quiz_item['ex']}"
-
-query = "What are the common symptoms of TB?"
-result = qa_chain.invoke({"query": query})
-print("Answer:", result["result"])
-
-query = "what are symptoms of covid 19"
-result = qa_chain.invoke({"query": query})
-print("Answer:", result["result"])
-
-query = "What are the 5 common symptoms of TB I should tell people about? Please answer in Hindi"
-result = qa_chain.invoke({"query": query})
-print("Answer:", result["result"])
-
-query = "Are fever, chest pain , loss of appetite symptoms of TB?"
-result = qa_chain.invoke({"query": query})
-print("Answer:", result["result"])
-
-response = answer_query("Sumit", "Are fever, night sweats, loss of appetite symptoms of TB?", lang="en")
-print("Answer:", response)
-
-quiz = generate_quiz_from_topic("TB symptoms", n_questions=5, lang="en")
-print(quiz)
-
-quiz = generate_quiz_from_topic("TB symptoms", n_questions=5, lang="hi")
-print(quiz)
-
-intent_examples = {
-    "generate_quiz": [
-        "Give me a quiz on TB symptoms",
-        "Create MCQs for TB awareness",
-        "Can I get some practice questions?"
-    ],
-    "answer_query": [
-        "How can we prevent TB?",
-        "What are TB symptoms?",
-        "Tell me about TB treatment duration"
-    ],
-    "grade_answer": [
-        "Evaluate my quiz answers",
-        "Did I get this question right?",
-        "Score my response"
-    ]
-}
-
-from langchain.schema import Document
-
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-# Flatten examples into documents with metadata
-intent_docs = []
-for intent, examples in intent_examples.items():
-    for ex in examples:
-        intent_docs.append(Document(page_content=ex, metadata={"intent": intent}))
-
-intent_index = FAISS.from_documents(intent_docs, embedding_model)
-
-def route_intent_semantic(user_input):
-    results = intent_index.similarity_search(user_input, k=1)
-    if results:
-        return results[0].metadata["intent"]
-    return "default"
-
-user_input = "Can you give me a quiz on TB symptoms?"
-intent = route_intent_semantic(user_input)
-
-def ask_llm(intent):
-  if intent == "generate_quiz":
-      response = generate_quiz_from_topic(user_input, n_questions=5, lang="en")
-  elif intent == "answer_query":
-      response = answer_query("Sumit", user_input, lang="en")
-  elif intent == "grade_answer":
-      response = "Grading not yet wired—coming soon!"
-  else:
-      response = "Sorry, I couldn't understand your request. Please try again."
-  return response
-
-user_input = "Can you give me some TB symptoms?"
-intent = route_intent_semantic(user_input)
-response = ask_llm(intent)
-print("Response:", response)
-
-user_input = "Can you give some basic ways we can prevent TB from spreading? Can you please reply in Hindi"
-intent = route_intent_semantic(user_input)
-response = ask_llm(intent)
-print("Response:", response)
-
-user_input = "Can you give some basic ways we can prevent TB from spreading?"
-intent = route_intent_semantic(user_input)
-response = ask_llm(intent)
-print("Response:", response)
-
+    # Launch app
+    launch_app()
