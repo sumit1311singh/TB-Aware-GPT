@@ -11,18 +11,33 @@ Original file is located at
 
 ! pip install chromadb
 
+! pip install tavily
+
 from openai import OpenAI
 import gradio as gr
 import os
 import PyPDF2
 import chromadb
 from dotenv import load_dotenv
+import requests
+from urllib.parse import urlparse
+import re
 
-os.environ["OPENAI_API_KEY"] = ""
+os.environ["OPENAI_API_KEY"] = "" #Add your OPENAI API Key
 
 load_dotenv()
 from openai import OpenAI
 client = OpenAI(api_key="")
+
+# Initialize Tavily client with error handling
+try:
+    from tavily import TavilyClient
+    tavily_client = TavilyClient(api_key="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")
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
+    print("⚠️  Tavily not installed. Web search functionality will be disabled.")
+    print("💡 Run: pip install tavily-python")
 
 # Initialize ChromaDB
 chroma_client = chromadb.Client()
@@ -53,14 +68,14 @@ def store_pdf_in_db(pdf_path):
         chunks = chunk_text(text)
 
         # Clear existing data
-        collection.delete(where={"filename": "National-Guidelines-for-Management-of-DR-TB_Final.pdf"})
+        collection.delete(where={"source": {"$ne": ""}})  # Delete all documents
 
         # Add chunks to ChromaDB
         for i, chunk in enumerate(chunks):
             collection.add(
                 documents=[chunk],
                 metadatas=[{"source": pdf_path, "chunk_id": i}],
-                ids=[f"chunk_{i}"]
+                ids=[f"chunk_{i}_{os.path.basename(pdf_path)}"]
             )
         return f"✅ Successfully loaded {len(chunks)} chunks from {pdf_path}"
     except Exception as e:
@@ -68,22 +83,104 @@ def store_pdf_in_db(pdf_path):
 
 def get_relevant_context(query, n_results=3):
     """Retrieve relevant context from ChromaDB"""
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
-    return "\n\n".join(results['documents'][0]) if results['documents'] else ""
+    try:
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
+        return "\n\n".join(results['documents'][0]) if results['documents'] else ""
+    except Exception as e:
+        print(f"ChromaDB query error: {e}")
+        return ""
+
+def is_pdf_context_relevant(pdf_context, query):
+    """Check if PDF context is actually relevant to the query"""
+    if not pdf_context or len(pdf_context.strip()) < 50:
+        return False
+
+    # Check for common irrelevant patterns in PDF context
+    irrelevant_patterns = [
+        "table of contents", "copyright", "abstract", "references",
+        "appendix", "index", "acknowledg", "preface"
+    ]
+
+    pdf_lower = pdf_context.lower()
+    query_lower = query.lower()
+
+    # If PDF context contains many irrelevant sections, it's likely not useful
+    irrelevant_count = sum(1 for pattern in irrelevant_patterns if pattern in pdf_lower)
+    if irrelevant_count > 2:
+        return False
+
+    # Check if query terms actually appear in the context
+    query_terms = query_lower.split()
+    relevant_terms = sum(1 for term in query_terms if len(term) > 3 and term in pdf_lower)
+
+    # If less than 30% of meaningful query terms are in context, consider it irrelevant
+    meaningful_terms = [term for term in query_terms if len(term) > 3]
+    if meaningful_terms and (relevant_terms / len(meaningful_terms)) < 0.3:
+        return False
+
+    return True
+
+def search_with_tavily(query):
+    """Search using Tavily and get content from first result"""
+    if not TAVILY_AVAILABLE:
+        return "Web search unavailable. Please install tavily-python: pip install tavily-python"
+
+    try:
+        # Search for the query
+        search_response = tavily_client.search(
+            query=query,
+            search_depth="basic",
+            max_results=3
+        )
+
+        if not search_response.get('results'):
+            return "No search results found."
+
+        # Get the first result
+        first_result = search_response['results'][0]
+        first_url = first_result.get('url', '')
+
+        # Use Tavily's content if available
+        content = first_result.get('content', '')
+
+        if not content:
+            content = f"Title: {first_result.get('title', 'N/A')}\nURL: {first_url}"
+
+        # Check if it's a PDF
+        if first_url.lower().endswith('.pdf'):
+            return f"📄 PDF Source: {first_url}\n\nThis appears to be a PDF document. Please visit the link to view the PDF: {first_url}"
+
+        return f"🔍 Search Result from: {first_url}\n\n{content}"
+
+    except Exception as e:
+        return f"❌ Search error: {str(e)}"
 
 def chat_with_tb_bot(message, history):
+    # First try to get relevant context from PDF
+    pdf_context = get_relevant_context(message)
+
+    # Check if PDF context is actually relevant
+    use_pdf = is_pdf_context_relevant(pdf_context, message)
+
+    system_prompt = """You are a friendlyTB Awareness Bot. Follow these rules:
+    1. Use the provided context to answer questions accurately
+    2. If the context doesn't fully answer the question, use your knowledge to provide a complete answer
+    3. Be educational and clear in your explanations"""
+
+    if use_pdf:
+        # Use PDF context
+        user_content = f"Context from PDF:\n{pdf_context}\n\nQuestion: {message}"
+        source_note = "📚 Answer based on uploaded PDF"
+    else:
+        # Use web search
+        search_results = search_with_tavily(message)
+        user_content = f"Search Results:\n{search_results}\n\nQuestion: {message}"
+        source_note = "🔍 Answer based on web search"
+
     try:
-        # Get relevant context from PDF
-        context = get_relevant_context(message)
-
-        system_prompt = """You are a TB Aware Bot. Use the provided context from PDFs to answer questions accurately.
-        If the context doesn't contain relevant information, use your general knowledge but mention this."""
-
-        user_content = f"Context from PDF:\n{context}\n\nQuestion: {message}"
-
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -93,12 +190,11 @@ def chat_with_tb_bot(message, history):
             temperature=0.2
         )
 
-        return response.choices[0].message.content
+        bot_response = response.choices[0].message.content
+        return f"{source_note}\n\n{bot_response}"
+
     except Exception as e:
-        import traceback
-        print("❌ Backend error:", e)
-        traceback.print_exc()
-        return f"❌ Error in backend: {str(e)}"
+        return f"❌ Error generating response: {str(e)}"
 
 def load_pdf_and_chat(pdf_file, message, history):
     # First store the PDF
@@ -119,11 +215,18 @@ def launch_app():
                 load_btn = gr.Button("Load PDF into Knowledge Base")
                 load_status = gr.Textbox(label="Load Status", interactive=False)
 
+                gr.Markdown("""
+                ### How it works:
+                1. **Upload a PDF** - Answers will prioritize PDF content ONLY when relevant
+                2. **Ask questions** - If PDF doesn't have relevant answers, web search will be used
+                3. **Clear indicators** - Sources are clearly marked (📚 PDF or 🔍 Web)
+                """)
+
             with gr.Column():
                 chat_interface = gr.ChatInterface(
                     fn=chat_with_tb_bot,
                     title="Chat with TB Aware Bot",
-                    description="Ask questions about the loaded PDF or related to TB"
+                    description="Ask questions about the loaded PDF or related to TB. The bot will use PDF content only when relevant, otherwise use web search."
                 )
 
         # Load PDF when button clicked
@@ -149,11 +252,11 @@ def download_pdf_from_github(url, filename="TBAwarenessFile.pdf"):
     return filename
 
 if __name__ == "__main__":
-    # Example GitHub raw URL
-    github_pdf_url = "https://raw.githubusercontent.com/sumit1311singh/TB-Aware-GPT/main/National-Guidelines-for-Management-of-DR-TB_Final.pdf"
+    # Correct GitHub raw URL
+    github_pdf_url = "https://github.com/sumit1311singh/TB-Aware-GPT/raw/main/National-Guidelines-for-Management-of-DR-TB_Final.pdf"
 
     # Download PDF
-    pdf_file = download_pdf_from_github(github_pdf_url, "TBAwarenessFile.pdf")
+    pdf_file = download_pdf_from_github(github_pdf_url, "DRTB_Guidelines.pdf")
     print(f"Downloaded PDF: {pdf_file}")
 
     # Store in DB
@@ -161,3 +264,4 @@ if __name__ == "__main__":
 
     # Launch app
     launch_app()
+
